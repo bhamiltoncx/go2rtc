@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"hash/fnv"
 	"io"
 	"log"
 	"net/http"
@@ -360,7 +361,7 @@ func (a *API) ExtendStream(stream *Stream) error {
 
 	// a stream outlives the hour-long access token, so refresh once on 401
 	for attempt := 0; ; attempt++ {
-		if err := limits.Command(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
+		if err := limits.CommandBackground(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
 			return err
 		}
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
@@ -419,8 +420,17 @@ func (a *API) ExtendStream(stream *Stream) error {
 }
 
 // keepAlive extends the stream a minute before each expiry until Stop.
+// extendSpread returns a per-device offset in [0, 2 min) so that sessions
+// dialed together do not extend together. Deterministic, so a reconnect
+// lands the same stream in the same slot.
+func extendSpread(deviceID string) time.Duration {
+	h := fnv.New32a()
+	h.Write([]byte(deviceID))
+	return time.Duration(h.Sum32()%120) * time.Second
+}
+
 func (a *API) keepAlive(stream *Stream) *session {
-	return newSession(stream.ExpiresAt, time.Minute, func() (time.Time, error) {
+	return newSession(stream.ExpiresAt, time.Minute, extendSpread(stream.DeviceID), func() (time.Time, error) {
 		if err := a.ExtendStream(stream); err != nil {
 			return time.Time{}, err
 		}
@@ -512,7 +522,7 @@ func (a *API) StopRTSPStream(stream *Stream) error {
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		stream.ProjectID + "/devices/" + stream.DeviceID + ":executeCommand"
-	if err := limits.Command(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
+	if err := limits.CommandBackground(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
 		return err
 	}
 	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))

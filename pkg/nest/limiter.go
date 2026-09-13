@@ -36,6 +36,11 @@ const (
 	extendMaxWait = 50 * time.Second
 	// how long to hold off after Google actually answered 429
 	penaltyAfter429 = time.Minute
+
+	// slots per minute of the project budget that keep-alives and other
+	// background calls leave free, so a dial - a consumer waiting on a
+	// camera - is never starved by nine sessions extending at once
+	dialReserve = 3
 )
 
 // ThrottledError is returned when a request would have had to wait longer
@@ -70,11 +75,17 @@ func (w *window) prune(now time.Time) {
 // earliest returns the soonest time at or after now at which one more call
 // fits in the window.
 func (w *window) earliest(now time.Time) time.Time {
+	return w.earliestWithin(now, w.limit)
+}
+
+// earliestWithin is earliest for a caller allowed only `limit` of the
+// window's slots.
+func (w *window) earliestWithin(now time.Time, limit int) time.Time {
 	w.prune(now)
-	if len(w.times) < w.limit {
+	if len(w.times) < limit {
 		return now
 	}
-	return w.times[len(w.times)-w.limit].Add(w.per)
+	return w.times[len(w.times)-limit].Add(w.per)
 }
 
 func (w *window) add(t time.Time) {
@@ -122,6 +133,12 @@ func (l *limiter) window(key string, limit int, per time.Duration) *window {
 // that slot in all of them, and returns how long the caller must wait. If the
 // wait exceeds maxWait nothing is booked and a ThrottledError is returned.
 func (l *limiter) reserve(windows []*window, projectID string, maxWait time.Duration) (time.Duration, error) {
+	return l.reserveWithin(windows, nil, projectID, maxWait)
+}
+
+// reserveWithin is reserve with a per-window cap on how many of its slots
+// this caller may use; a nil or missing entry means all of them.
+func (l *limiter) reserveWithin(windows []*window, caps map[*window]int, projectID string, maxWait time.Duration) (time.Duration, error) {
 	now := l.now()
 	t := now
 	if until, ok := l.penalty[projectID]; ok {
@@ -132,7 +149,11 @@ func (l *limiter) reserve(windows []*window, projectID string, maxWait time.Dura
 		}
 	}
 	for _, w := range windows {
-		if e := w.earliest(now); e.After(t) {
+		limit := w.limit
+		if c, ok := caps[w]; ok {
+			limit = c
+		}
+		if e := w.earliestWithin(now, limit); e.After(t) {
 			t = e
 		}
 	}
@@ -158,6 +179,30 @@ func (l *limiter) Command(projectID, deviceID, command string, maxWait time.Dura
 		l.window("dev:"+projectID+":"+deviceID+":h", devicePerHour, time.Hour),
 	}
 	wait, err := l.reserve(windows, projectID, maxWait)
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	if wait > 0 {
+		l.sleep(wait)
+	}
+	return nil
+}
+
+// CommandBackground is Command for keep-alives and other calls no consumer
+// is waiting on: it leaves dialReserve slots of the project's per-minute
+// budget free for dials.
+func (l *limiter) CommandBackground(projectID, deviceID, command string, maxWait time.Duration) error {
+	l.mu.Lock()
+	project := l.window("cmd:"+projectID, executeCommandPerMinute, time.Minute)
+	windows := []*window{
+		project,
+		l.window("cmd:"+projectID+":"+deviceID+":"+command, commandPerDevicePerMin, time.Minute),
+		l.window("dev:"+projectID+":"+deviceID+":m", devicePerMinute, time.Minute),
+		l.window("dev:"+projectID+":"+deviceID+":h", devicePerHour, time.Hour),
+	}
+	caps := map[*window]int{project: executeCommandPerMinute - dialReserve}
+	wait, err := l.reserveWithin(windows, caps, projectID, maxWait)
 	l.mu.Unlock()
 	if err != nil {
 		return err
