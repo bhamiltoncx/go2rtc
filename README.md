@@ -11,6 +11,7 @@
 > - **Fallback sources only for real failures.** A throttled or 429'd dial fails the consumer instead of falling through to a placeholder source, preloads attach only to the primary source, and a preload that fails at startup retries on a back-off.
 > - **Cold dials no longer hang.** A consumer that triggers the WebRTC dial no longer gets stuck on a receiver that never receives packets when Google sends on a different H264 payload type than the first one in its SDP answer (fixes `frame.jpeg` hanging on idle streams).
 > - **No corrupt keyframes on attach.** Drops H264 FU-A fragments received before their start bit; fixes intermittent `frame.jpeg` "exit status 183" failures (upstream #2490, PR #2491, pion/rtp#370).
+> - **Packet loss no longer produces smeared keyframes.** The H264 depacketizer watches RTP sequence numbers; on a gap it discards the partial access unit and passes nothing on until the next keyframe received in full (the H264 counterpart of upstream PR #2479 for H265).
 > - **Readable snapshot errors.** ffmpeg's stderr and the NAL unit list are included when a keyframe transcode fails.
 > - **GOP cache** (`#gop=1`). Rebase of upstream PR #1887 by seydx: consumers attaching mid-stream get the cached keyframe immediately.
 

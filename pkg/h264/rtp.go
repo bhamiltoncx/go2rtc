@@ -27,11 +27,30 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	// tail of a slice. Track fragment state and drop such tails ourselves.
 	inFragment := false
 
+	// RTP over WebRTC is lossy. A packet missing from the middle of a
+	// fragmented IDR leaves a NAL with a hole in it; a decoder renders what it
+	// has and smears the rest, and every P-frame after it references the
+	// damage. Watch the sequence numbers: on a gap discard whatever is being
+	// assembled and pass nothing on until the next access unit that begins
+	// with a keyframe received in full.
+	var lastSeq uint16
+	haveSeq := false
+	waitKeyframe := false
+
 	return func(packet *rtp.Packet) {
 		if packet.Version == RTPPacketVersionAVC {
 			handler(packet)
 			return
 		}
+
+		if haveSeq && packet.SequenceNumber != lastSeq+1 {
+			depack = &codecs.H264Packet{IsAVC: true}
+			inFragment = false
+			buf = buf[:0]
+			waitKeyframe = true
+		}
+		lastSeq = packet.SequenceNumber
+		haveSeq = true
 
 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
 
@@ -122,6 +141,13 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 		}
 
 		//log.Printf("[AVC] %v, len: %d, ts: %10d, seq: %d", NALUTypes(payload), len(payload), packet.Timestamp, packet.SequenceNumber)
+
+		if waitKeyframe {
+			if !IsKeyframe(payload) {
+				return
+			}
+			waitKeyframe = false
+		}
 
 		clone := *packet
 		clone.Version = RTPPacketVersionAVC
