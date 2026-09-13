@@ -41,12 +41,11 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 			if err = prod.Dial(); err != nil {
 				log.Trace().Err(err).Msgf("[streams] dial cons=%d prod=%d", consN, prodN)
 				prodErrors[prodN] = err
-				// a passing failure (rate limit, quota, 5xx) is not a reason
-				// to fall through to the next source: consumers would be
-				// pinned to a fallback while the primary is briefly busy
-				if core.IsTemporary(err) {
-					break producers
-				}
+				// a preload must not settle for a fallback (see isPreload);
+				// any other consumer takes the next source, so a viewer sees
+				// a placeholder rather than an error while the primary is
+				// switched off or briefly rate limited, and picks the
+				// primary up again on its next request
 				if primaryOnly {
 					break producers
 				}
