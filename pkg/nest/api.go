@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -11,22 +12,37 @@ import (
 	"time"
 )
 
+// API holds the OAuth token for one set of credentials. NewAPI caches and
+// shares it between every stream that uses those credentials, so nothing
+// stream-specific may live here - that belongs in Stream.
 type API struct {
 	Token     string
 	ExpiresAt time.Time
+}
 
-	StreamProjectID string
-	StreamDeviceID  string
-	StreamExpiresAt time.Time
+// Stream is the state Google hands back for one live stream on one device.
+type Stream struct {
+	ProjectID string
+	DeviceID  string
+	ExpiresAt time.Time
 
 	// WebRTC
-	StreamSessionID string
+	MediaSessionID string
 
 	// RTSP
 	StreamToken          string
 	StreamExtensionToken string
+}
 
-	extendTimer *time.Timer
+// wrongStatus includes Google's error body, which is the only place the
+// actual reason (device offline, session unknown, ...) is reported.
+func wrongStatus(res *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+	msg := "nest: wrong status: " + res.Status
+	if s := strings.TrimSpace(string(body)); s != "" {
+		msg += ": " + s
+	}
+	return errors.New(msg)
 }
 
 type Auth struct {
@@ -149,7 +165,7 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 	return devices, nil
 }
 
-func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
+func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, *Stream, error) {
 	var reqv struct {
 		Command string `json:"command"`
 		Params  struct {
@@ -161,7 +177,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 	b, err := json.Marshal(reqv)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
@@ -173,7 +189,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
@@ -181,7 +197,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		client := &http.Client{Timeout: time.Second * 5000}
 		res, err := client.Do(req)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 
 		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
@@ -190,7 +206,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 			if attempt < maxRetries-1 {
 				// Get new token from Google
 				if err := a.refreshToken(); err != nil {
-					return "", err
+					return "", nil, err
 				}
 				time.Sleep(retryDelay)
 				retryDelay *= 2 // exponential backoff
@@ -201,7 +217,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		defer res.Body.Close()
 
 		if res.StatusCode != 200 {
-			return "", errors.New("nest: wrong status: " + res.Status)
+			return "", nil, wrongStatus(res)
 		}
 
 		var resv struct {
@@ -213,18 +229,20 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 		}
 
 		if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
-			return "", err
+			return "", nil, err
 		}
 
-		a.StreamProjectID = projectID
-		a.StreamDeviceID = deviceID
-		a.StreamSessionID = resv.Results.MediaSessionID
-		a.StreamExpiresAt = resv.Results.ExpiresAt
+		stream := &Stream{
+			ProjectID:      projectID,
+			DeviceID:       deviceID,
+			ExpiresAt:      resv.Results.ExpiresAt,
+			MediaSessionID: resv.Results.MediaSessionID,
+		}
 
-		return resv.Results.Answer, nil
+		return resv.Results.Answer, stream, nil
 	}
 
-	return "", errors.New("nest: max retries exceeded")
+	return "", nil, errors.New("nest: max retries exceeded")
 }
 
 func (a *API) refreshToken() error {
@@ -262,7 +280,9 @@ func (a *API) refreshToken() error {
 	return nil
 }
 
-func (a *API) ExtendStream() error {
+// ExtendStream asks Google for another five minutes and updates the stream's
+// expiry and tokens in place.
+func (a *API) ExtendStream(stream *Stream) error {
 	var reqv struct {
 		Command string `json:"command"`
 		Params  struct {
@@ -271,14 +291,14 @@ func (a *API) ExtendStream() error {
 		} `json:"params"`
 	}
 
-	if a.StreamToken != "" {
+	if stream.StreamToken != "" {
 		// RTSP
 		reqv.Command = "sdm.devices.commands.CameraLiveStream.ExtendRtspStream"
-		reqv.Params.StreamExtensionToken = a.StreamExtensionToken
+		reqv.Params.StreamExtensionToken = stream.StreamExtensionToken
 	} else {
 		// WebRTC
 		reqv.Command = "sdm.devices.commands.CameraLiveStream.ExtendWebRtcStream"
-		reqv.Params.MediaSessionID = a.StreamSessionID
+		reqv.Params.MediaSessionID = stream.MediaSessionID
 	}
 
 	b, err := json.Marshal(reqv)
@@ -287,7 +307,156 @@ func (a *API) ExtendStream() error {
 	}
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+		stream.ProjectID + "/devices/" + stream.DeviceID + ":executeCommand"
+
+	// a stream outlives the hour-long access token, so refresh once on 401
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+		if err != nil {
+			return err
+		}
+
+		req.Header.Set("Authorization", "Bearer "+a.Token)
+
+		client := &http.Client{Timeout: time.Second * 5000}
+		res, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+
+		if res.StatusCode == 401 && attempt == 0 {
+			res.Body.Close()
+			if err = a.refreshToken(); err != nil {
+				return err
+			}
+			continue
+		}
+
+		defer res.Body.Close()
+
+		if res.StatusCode != 200 {
+			return wrongStatus(res)
+		}
+
+		var resv struct {
+			Results struct {
+				ExpiresAt            time.Time `json:"expiresAt"`
+				MediaSessionID       string    `json:"mediaSessionId"`
+				StreamExtensionToken string    `json:"streamExtensionToken"`
+				StreamToken          string    `json:"streamToken"`
+			} `json:"results"`
+		}
+
+		if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+			return err
+		}
+
+		stream.ExpiresAt = resv.Results.ExpiresAt
+		if resv.Results.MediaSessionID != "" {
+			stream.MediaSessionID = resv.Results.MediaSessionID
+		}
+		if resv.Results.StreamExtensionToken != "" {
+			stream.StreamExtensionToken = resv.Results.StreamExtensionToken
+		}
+		if resv.Results.StreamToken != "" {
+			stream.StreamToken = resv.Results.StreamToken
+		}
+
+		return nil
+	}
+}
+
+// keepAlive extends the stream a minute before each expiry until Stop.
+func (a *API) keepAlive(stream *Stream) *session {
+	return newSession(stream.ExpiresAt, time.Minute, func() (time.Time, error) {
+		if err := a.ExtendStream(stream); err != nil {
+			return time.Time{}, err
+		}
+		return stream.ExpiresAt, nil
+	})
+}
+
+func (a *API) GenerateRtspStream(projectID, deviceID string) (string, *Stream, error) {
+	var reqv struct {
+		Command string   `json:"command"`
+		Params  struct{} `json:"params"`
+	}
+	reqv.Command = "sdm.devices.commands.CameraLiveStream.GenerateRtspStream"
+
+	b, err := json.Marshal(reqv)
+	if err != nil {
+		return "", nil, err
+	}
+
+	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+		projectID + "/devices/" + deviceID + ":executeCommand"
+	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
+	if err != nil {
+		return "", nil, err
+	}
+
+	req.Header.Set("Authorization", "Bearer "+a.Token)
+
+	client := &http.Client{Timeout: time.Second * 5000}
+	res, err := client.Do(req)
+	if err != nil {
+		return "", nil, err
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode != 200 {
+		return "", nil, wrongStatus(res)
+	}
+
+	var resv struct {
+		Results struct {
+			StreamURLs           map[string]string `json:"streamUrls"`
+			StreamExtensionToken string            `json:"streamExtensionToken"`
+			StreamToken          string            `json:"streamToken"`
+			ExpiresAt            time.Time         `json:"expiresAt"`
+		} `json:"results"`
+	}
+
+	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
+		return "", nil, err
+	}
+
+	if _, ok := resv.Results.StreamURLs["rtspUrl"]; !ok {
+		return "", nil, errors.New("nest: failed to generate rtsp url")
+	}
+
+	stream := &Stream{
+		ProjectID:            projectID,
+		DeviceID:             deviceID,
+		ExpiresAt:            resv.Results.ExpiresAt,
+		StreamToken:          resv.Results.StreamToken,
+		StreamExtensionToken: resv.Results.StreamExtensionToken,
+	}
+
+	return resv.Results.StreamURLs["rtspUrl"], stream, nil
+}
+
+func (a *API) StopRTSPStream(stream *Stream) error {
+	if stream == nil || stream.ProjectID == "" || stream.DeviceID == "" {
+		return errors.New("nest: tried to stop rtsp stream without a project or device ID")
+	}
+
+	var reqv struct {
+		Command string `json:"command"`
+		Params  struct {
+			StreamExtensionToken string `json:"streamExtensionToken"`
+		} `json:"params"`
+	}
+	reqv.Command = "sdm.devices.commands.CameraLiveStream.StopRtspStream"
+	reqv.Params.StreamExtensionToken = stream.StreamExtensionToken
+
+	b, err := json.Marshal(reqv)
+	if err != nil {
+		return err
+	}
+
+	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+		stream.ProjectID + "/devices/" + stream.DeviceID + ":executeCommand"
 	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 	if err != nil {
 		return err
@@ -303,129 +472,8 @@ func (a *API) ExtendStream() error {
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
+		return wrongStatus(res)
 	}
-
-	var resv struct {
-		Results struct {
-			ExpiresAt            time.Time `json:"expiresAt"`
-			MediaSessionID       string    `json:"mediaSessionId"`
-			StreamExtensionToken string    `json:"streamExtensionToken"`
-			StreamToken          string    `json:"streamToken"`
-		} `json:"results"`
-	}
-
-	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
-		return err
-	}
-
-	a.StreamSessionID = resv.Results.MediaSessionID
-	a.StreamExpiresAt = resv.Results.ExpiresAt
-	a.StreamExtensionToken = resv.Results.StreamExtensionToken
-	a.StreamToken = resv.Results.StreamToken
-
-	return nil
-}
-
-func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
-	var reqv struct {
-		Command string   `json:"command"`
-		Params  struct{} `json:"params"`
-	}
-	reqv.Command = "sdm.devices.commands.CameraLiveStream.GenerateRtspStream"
-
-	b, err := json.Marshal(reqv)
-	if err != nil {
-		return "", err
-	}
-
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		projectID + "/devices/" + deviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
-	if err != nil {
-		return "", err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-
-	if res.StatusCode != 200 {
-		return "", errors.New("nest: wrong status: " + res.Status)
-	}
-
-	var resv struct {
-		Results struct {
-			StreamURLs           map[string]string `json:"streamUrls"`
-			StreamExtensionToken string            `json:"streamExtensionToken"`
-			StreamToken          string            `json:"streamToken"`
-			ExpiresAt            time.Time         `json:"expiresAt"`
-		} `json:"results"`
-	}
-
-	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
-		return "", err
-	}
-
-	if _, ok := resv.Results.StreamURLs["rtspUrl"]; !ok {
-		return "", errors.New("nest: failed to generate rtsp url")
-	}
-
-	a.StreamProjectID = projectID
-	a.StreamDeviceID = deviceID
-	a.StreamToken = resv.Results.StreamToken
-	a.StreamExtensionToken = resv.Results.StreamExtensionToken
-	a.StreamExpiresAt = resv.Results.ExpiresAt
-
-	return resv.Results.StreamURLs["rtspUrl"], nil
-}
-
-func (a *API) StopRTSPStream() error {
-	if a.StreamProjectID == "" || a.StreamDeviceID == "" {
-		return errors.New("nest: tried to stop rtsp stream without a project or device ID")
-	}
-
-	var reqv struct {
-		Command string `json:"command"`
-		Params  struct {
-			StreamExtensionToken string `json:"streamExtensionToken"`
-		} `json:"params"`
-	}
-	reqv.Command = "sdm.devices.commands.CameraLiveStream.StopRtspStream"
-	reqv.Params.StreamExtensionToken = a.StreamExtensionToken
-
-	b, err := json.Marshal(reqv)
-	if err != nil {
-		return err
-	}
-
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
-	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("Authorization", "Bearer "+a.Token)
-
-	client := &http.Client{Timeout: time.Second * 5000}
-	res, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-
-	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
-	}
-
-	a.StreamProjectID = ""
-	a.StreamDeviceID = ""
-	a.StreamExtensionToken = ""
-	a.StreamToken = ""
 
 	return nil
 }
@@ -462,25 +510,4 @@ type Device struct {
 		Parent      string `json:"parent"`
 		DisplayName string `json:"displayName"`
 	} `json:"parentRelations"`
-}
-
-func (a *API) StartExtendStreamTimer() {
-	if a.extendTimer != nil {
-		return
-	}
-
-	a.extendTimer = time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
-	go func() {
-		<-a.extendTimer.C
-		if err := a.ExtendStream(); err != nil {
-			return
-		}
-	}()
-}
-
-func (a *API) StopExtendStreamTimer() {
-	if a.extendTimer != nil {
-		a.extendTimer.Stop()
-		a.extendTimer = nil
-	}
 }
