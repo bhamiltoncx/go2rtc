@@ -34,17 +34,6 @@ type Stream struct {
 	StreamExtensionToken string
 }
 
-// wrongStatus includes Google's error body, which is the only place the
-// actual reason (device offline, session unknown, ...) is reported.
-func wrongStatus(res *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
-	msg := "nest: wrong status: " + res.Status
-	if s := strings.TrimSpace(string(body)); s != "" {
-		msg += ": " + s
-	}
-	return errors.New(msg)
-}
-
 type Auth struct {
 	AccessToken string
 }
@@ -57,6 +46,38 @@ type DeviceInfo struct {
 
 var cache = map[string]*API{}
 var cacheMu sync.Mutex
+
+// StatusError is a non-200 answer from Google. Body is the (truncated)
+// response body, which is the only place the actual reason is reported,
+// e.g. `"status": "FAILED_PRECONDITION"` for a camera that is switched off.
+type StatusError struct {
+	Code int
+	Msg  string
+}
+
+func (e *StatusError) Error() string {
+	return e.Msg
+}
+
+func newStatusError(res *http.Response) error {
+	body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
+	msg := "nest: wrong status: " + res.Status
+	if s := strings.TrimSpace(string(body)); s != "" {
+		msg += ": " + s
+	}
+	return &StatusError{Code: res.StatusCode, Msg: msg}
+}
+
+// retryable reports whether a failed request may succeed if repeated soon.
+// Any 4xx that survived ExchangeSDP's own 401/409/429 handling is a
+// definitive answer about the device and only wastes the retry window.
+func retryable(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code < 400 || se.Code >= 500
+	}
+	return true
+}
 
 func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 	cacheMu.Lock()
@@ -217,7 +238,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, *Stream, e
 		defer res.Body.Close()
 
 		if res.StatusCode != 200 {
-			return "", nil, wrongStatus(res)
+			return "", nil, newStatusError(res)
 		}
 
 		var resv struct {
@@ -335,7 +356,7 @@ func (a *API) ExtendStream(stream *Stream) error {
 		defer res.Body.Close()
 
 		if res.StatusCode != 200 {
-			return wrongStatus(res)
+			return newStatusError(res)
 		}
 
 		var resv struct {
@@ -405,7 +426,7 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, *Stream, e
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return "", nil, wrongStatus(res)
+		return "", nil, newStatusError(res)
 	}
 
 	var resv struct {
@@ -472,7 +493,7 @@ func (a *API) StopRTSPStream(stream *Stream) error {
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return wrongStatus(res)
+		return newStatusError(res)
 	}
 
 	return nil

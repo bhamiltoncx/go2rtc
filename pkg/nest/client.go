@@ -140,6 +140,11 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		answer, stream, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 		if err != nil {
 			lastErr = err
+			// a switched-off camera (400 FAILED_PRECONDITION) or an unknown
+			// device (404) will not change within the 90s retry window
+			if !retryable(err) {
+				return nil, err
+			}
 			if attempt < maxRetries-1 {
 				time.Sleep(retryDelay)
 				retryDelay *= 2
