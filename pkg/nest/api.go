@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -225,6 +226,7 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, *Stream, e
 		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
 			res.Body.Close()
 			if attempt < maxRetries-1 {
+				log.Printf("nest: %s from GenerateWebRtcStream for %s, refreshing token and retrying in %s", res.Status, deviceID, retryDelay)
 				// Get new token from Google
 				if err := a.refreshToken(); err != nil {
 					return "", nil, err
