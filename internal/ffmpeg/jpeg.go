@@ -27,7 +27,16 @@ func transcode(b []byte, args string) ([]byte, error) {
 	cmdArgs := shell.QuoteSplit(args)
 	cmd := exec.Command(cmdArgs[0], cmdArgs[1:]...)
 	cmd.Stdin = bytes.NewBuffer(b)
-	return cmd.Output()
+	out, err := cmd.Output()
+	// "exit status 183" alone says nothing; ffmpeg's stderr says why
+	if exitErr, ok := err.(*exec.ExitError); ok && len(exitErr.Stderr) > 0 {
+		lines := bytes.Split(bytes.TrimSpace(exitErr.Stderr), []byte{'\n'})
+		if len(lines) > 5 {
+			lines = lines[len(lines)-5:]
+		}
+		err = fmt.Errorf("%w: %s", err, bytes.Join(lines, []byte("; ")))
+	}
+	return out, err
 }
 
 func defaultArgs() *ffmpeg.Args {

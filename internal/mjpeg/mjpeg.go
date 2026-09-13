@@ -2,6 +2,7 @@ package mjpeg
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -93,7 +94,10 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 	case core.CodecH264, core.CodecH265:
 		ts := time.Now()
 		var err error
+		sample := b
 		if b, err = ffmpeg.JPEGWithQuery(b, query); err != nil {
+			// which NAL units the keyframe consumer handed ffmpeg, e.g. "7:24 8:4 5:156010"
+			log.Warn().Err(err).Str("src", query.Get("src")).Str("nalus", annexbSummary(sample)).Msg("[mjpeg] keyframe transcode failed")
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -103,6 +107,29 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJPEGResponse(w, b)
+}
+
+// annexbSummary lists NAL unit types and sizes in an Annex B buffer, e.g. "7:31 8:4 5:48210".
+func annexbSummary(b []byte) string {
+	var sb strings.Builder
+	start := -1
+	for i := 0; i+3 < len(b); i++ {
+		if b[i] == 0 && b[i+1] == 0 && b[i+2] == 1 {
+			if start >= 0 {
+				end := i
+				if end > 0 && b[end-1] == 0 {
+					end--
+				}
+				fmt.Fprintf(&sb, "%d:%d ", b[start]&0x1F, end-start)
+			}
+			start = i + 3
+			i += 2
+		}
+	}
+	if start >= 0 && start < len(b) {
+		fmt.Fprintf(&sb, "%d:%d", b[start]&0x1F, len(b)-start)
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 var cache map[string]cacheEntry
