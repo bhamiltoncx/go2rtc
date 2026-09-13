@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
@@ -100,6 +101,43 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
 	return c.conn.MarshalJSON()
 }
 
+// Google answers a switched-off camera with 400 FAILED_PRECONDITION on every
+// GenerateWebRtcStream, and each of those calls counts against the project's
+// per-minute command quota. A dashboard that polls a few off cameras every
+// ten seconds is enough to earn 429s for every camera, and ExchangeSDP then
+// sleeps 30 s before retrying. Remember a definitive answer per device for a
+// short while so repeated dials of an off camera fail instantly without a
+// round trip, and let the fallback source take over.
+const definitiveErrorTTL = 60 * time.Second
+
+var (
+	definitiveMu     sync.Mutex
+	definitiveErrors = map[string]definitiveError{}
+)
+
+type definitiveError struct {
+	err   error
+	until time.Time
+}
+
+func recentDefinitiveError(deviceID string) error {
+	definitiveMu.Lock()
+	defer definitiveMu.Unlock()
+	if d, ok := definitiveErrors[deviceID]; ok {
+		if time.Now().Before(d.until) {
+			return d.err
+		}
+		delete(definitiveErrors, deviceID)
+	}
+	return nil
+}
+
+func rememberDefinitiveError(deviceID string, err error) {
+	definitiveMu.Lock()
+	definitiveErrors[deviceID] = definitiveError{err: err, until: time.Now().Add(definitiveErrorTTL)}
+	definitiveMu.Unlock()
+}
+
 func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
 	maxRetries := 3
 	retryDelay := time.Second * 30
@@ -137,12 +175,17 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		}
 
 		// 4. Exchange SDP via Hass
+		if err := recentDefinitiveError(deviceID); err != nil {
+			return nil, err
+		}
+
 		answer, stream, err := nestAPI.ExchangeSDP(projectID, deviceID, offer)
 		if err != nil {
 			lastErr = err
 			// a switched-off camera (400 FAILED_PRECONDITION) or an unknown
 			// device (404) will not change within the 90s retry window
 			if !retryable(err) {
+				rememberDefinitiveError(deviceID, err)
 				return nil, err
 			}
 			if attempt < maxRetries-1 {
