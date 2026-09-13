@@ -120,6 +120,14 @@ type definitiveError struct {
 	until time.Time
 }
 
+// isDeviceAnswer reports whether an error is Google's verdict on the device
+// (400 camera off, 404 unknown) rather than a quota or local throttling
+// answer that says nothing about the camera.
+func isDeviceAnswer(err error) bool {
+	var se *StatusError
+	return errors.As(err, &se) && se.Code >= 400 && se.Code < 500 && se.Code != 429
+}
+
 func recentDefinitiveError(deviceID string) error {
 	definitiveMu.Lock()
 	defer definitiveMu.Unlock()
@@ -185,7 +193,9 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 			// a switched-off camera (400 FAILED_PRECONDITION) or an unknown
 			// device (404) will not change within the 90s retry window
 			if !retryable(err) {
-				rememberDefinitiveError(deviceID, err)
+				if isDeviceAnswer(err) {
+					rememberDefinitiveError(deviceID, err)
+				}
 				return nil, err
 			}
 			if attempt < maxRetries-1 {

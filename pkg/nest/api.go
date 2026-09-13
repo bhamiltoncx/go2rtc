@@ -73,6 +73,10 @@ func newStatusError(res *http.Response) error {
 // Any 4xx that survived ExchangeSDP's own 401/409/429 handling is a
 // definitive answer about the device and only wastes the retry window.
 func retryable(err error) bool {
+	var te *ThrottledError
+	if errors.As(err, &te) {
+		return false
+	}
 	var se *StatusError
 	if errors.As(err, &se) {
 		return se.Code < 400 || se.Code >= 500
@@ -132,6 +136,9 @@ func NewAPI(clientID, clientSecret, refreshToken string) (*API, error) {
 
 func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" + projectID + "/devices"
+	if err := limits.List(projectID, dialMaxWait); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequest("GET", uri, nil)
 	if err != nil {
 		return nil, err
@@ -209,6 +216,10 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, *Stream, e
 	retryDelay := time.Second * 30
 
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		if err := limits.Command(projectID, deviceID, reqv.Command, dialMaxWait); err != nil {
+			return "", nil, err
+		}
+
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
 			return "", nil, err
@@ -222,8 +233,17 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, *Stream, e
 			return "", nil, err
 		}
 
-		// Handle 409 (Conflict), 429 (Too Many Requests), and 401 (Unauthorized)
-		if res.StatusCode == 409 || res.StatusCode == 429 || res.StatusCode == 401 {
+		// Google says the quota is spent: hold the whole project off for a
+		// minute and fail this dial now so a fallback source can take over,
+		// instead of sleeping 30 s with the consumer waiting.
+		if res.StatusCode == 429 {
+			limits.Penalize(projectID, penaltyAfter429)
+			log.Printf("nest: %s from GenerateWebRtcStream for %s, holding off for %s", res.Status, deviceID, penaltyAfter429)
+			return "", nil, newStatusError(res)
+		}
+
+		// Handle 409 (Conflict) and 401 (Unauthorized)
+		if res.StatusCode == 409 || res.StatusCode == 401 {
 			res.Body.Close()
 			if attempt < maxRetries-1 {
 				log.Printf("nest: %s from GenerateWebRtcStream for %s, refreshing token and retrying in %s", res.Status, deviceID, retryDelay)
@@ -334,6 +354,9 @@ func (a *API) ExtendStream(stream *Stream) error {
 
 	// a stream outlives the hour-long access token, so refresh once on 401
 	for attempt := 0; ; attempt++ {
+		if err := limits.Command(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
+			return err
+		}
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
 			return err
@@ -413,6 +436,9 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, *Stream, e
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		projectID + "/devices/" + deviceID + ":executeCommand"
+	if err := limits.Command(projectID, deviceID, reqv.Command, dialMaxWait); err != nil {
+		return "", nil, err
+	}
 	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 	if err != nil {
 		return "", nil, err
@@ -480,6 +506,9 @@ func (a *API) StopRTSPStream(stream *Stream) error {
 
 	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
 		stream.ProjectID + "/devices/" + stream.DeviceID + ":executeCommand"
+	if err := limits.Command(stream.ProjectID, stream.DeviceID, reqv.Command, extendMaxWait); err != nil {
+		return err
+	}
 	req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 	if err != nil {
 		return err
