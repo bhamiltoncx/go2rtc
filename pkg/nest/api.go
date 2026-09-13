@@ -60,6 +60,12 @@ func (e *StatusError) Error() string {
 	return e.Msg
 }
 
+// Temporary reports whether the status says nothing about the device: quota
+// (429) and server errors may succeed on a later try, a 400 or 404 will not.
+func (e *StatusError) Temporary() bool {
+	return e.Code == 429 || e.Code >= 500
+}
+
 func newStatusError(res *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(res.Body, 512))
 	msg := "nest: wrong status: " + res.Status

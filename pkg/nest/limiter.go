@@ -44,6 +44,10 @@ type ThrottledError struct {
 	Wait time.Duration
 }
 
+// Temporary marks local throttling as a passing condition, so a stream with
+// a fallback source does not switch to it.
+func (e *ThrottledError) Temporary() bool { return true }
+
 func (e *ThrottledError) Error() string {
 	return fmt.Sprintf("nest: rate limited locally, next slot in %s", e.Wait.Round(time.Second))
 }

@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
+	"github.com/AlexxIT/go2rtc/pkg/probe"
 )
 
 func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
@@ -14,6 +15,10 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	var prodErrors = make([]error, len(s.producers))
 	var prodMedias []*core.Media
 	var prodStarts []*Producer
+
+	// a preload keeps the primary source warm; it must never settle for a
+	// fallback, or the primary is left cold behind it
+	primaryOnly := isPreload(cons)
 
 	// Step 1. Get consumer medias
 	consMedias := cons.GetMedias()
@@ -36,6 +41,15 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 			if err = prod.Dial(); err != nil {
 				log.Trace().Err(err).Msgf("[streams] dial cons=%d prod=%d", consN, prodN)
 				prodErrors[prodN] = err
+				// a passing failure (rate limit, quota, 5xx) is not a reason
+				// to fall through to the next source: consumers would be
+				// pinned to a fallback while the primary is briefly busy
+				if core.IsTemporary(err) {
+					break producers
+				}
+				if primaryOnly {
+					break producers
+				}
 				continue
 			}
 
@@ -163,4 +177,9 @@ func appendString(s, elem string) string {
 		return elem
 	}
 	return s + ", " + elem
+}
+
+func isPreload(cons core.Consumer) bool {
+	p, ok := cons.(*probe.Probe)
+	return ok && p.FormatName == "preload"
 }
