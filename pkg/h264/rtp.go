@@ -21,8 +21,29 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 
 	buf := make([]byte, 0, 512*1024) // 512K
 
+	// pion's depacketizer appends every FU-A fragment to its buffer whether or
+	// not it saw the start bit, so a consumer that attaches mid-NAL (or loses
+	// the start fragment) would get a synthesized NAL header stapled onto the
+	// tail of a slice. Track fragment state and drop such tails ourselves.
+	inFragment := false
+
 	return func(packet *rtp.Packet) {
 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
+
+		if len(packet.Payload) >= 2 && packet.Payload[0]&0x1F == NALUTypeFUA {
+			start := packet.Payload[1]&0x80 != 0
+			end := packet.Payload[1]&0x40 != 0
+			switch {
+			case start:
+				if inFragment {
+					// previous fragment set never finished: discard its partial data
+					depack = &codecs.H264Packet{IsAVC: true}
+				}
+			case !inFragment:
+				return // tail of a NAL whose start we never saw
+			}
+			inFragment = !end
+		}
 
 		payload, err := depack.Unmarshal(packet.Payload)
 		if len(payload) == 0 || err != nil {
