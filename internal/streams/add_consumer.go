@@ -17,8 +17,14 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 	var prodStarts []*Producer
 
 	// a preload keeps the primary source warm; it must never settle for a
-	// fallback, or the primary is left cold behind it
-	primaryOnly := isPreload(cons)
+	// fallback, or the primary is left cold behind it. Restrict it to the
+	// first source outright: a per-media check is not enough, because a
+	// primary that failed for the first media is skipped for the next one
+	// and the fallback would be tried in its place.
+	producers := s.producers
+	if isPreload(cons) {
+		producers = producers[:1]
+	}
 
 	// Step 1. Get consumer medias
 	consMedias := cons.GetMedias()
@@ -26,7 +32,7 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 		log.Trace().Msgf("[streams] check cons=%d media=%s", consN, consMedia)
 
 	producers:
-		for prodN, prod := range s.producers {
+		for prodN, prod := range producers {
 			// check for loop request, ex. `camera1: ffmpeg:camera1`
 			if info, ok := cons.(core.Info); ok && prod.url == info.GetSource() {
 				log.Trace().Msgf("[streams] skip cons=%d prod=%d", consN, prodN)
@@ -41,14 +47,10 @@ func (s *Stream) AddConsumer(cons core.Consumer) (err error) {
 			if err = prod.Dial(); err != nil {
 				log.Trace().Err(err).Msgf("[streams] dial cons=%d prod=%d", consN, prodN)
 				prodErrors[prodN] = err
-				// a preload must not settle for a fallback (see isPreload);
 				// any other consumer takes the next source, so a viewer sees
 				// a placeholder rather than an error while the primary is
 				// switched off or briefly rate limited, and picks the
 				// primary up again on its next request
-				if primaryOnly {
-					break producers
-				}
 				continue
 			}
 
