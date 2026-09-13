@@ -29,6 +29,8 @@ streams:
     - ffmpeg:/config/standby.jpg#input=-loop 1 -framerate 2 -i /config/standby.jpg#video=h264#raw=-tune stillimage
 ```
 
+**Cold dials no longer hang.** `Dial` returns right after the SDP answer, before any track has arrived, so the consumer that triggered the dial binds to the first H264 codec in Google's answer (payload type 96). Google may then send on a different payload type; upstream's `OnTrack` matched receivers by codec pointer and created a second receiver, leaving the first consumer attached to one that never received a packet, so `api/frame.jpeg` on an idle stream hung until its timeout. `OnTrack` now reuses the idle early-bound receiver and points its codec at the one actually in use.
+
 **No more corrupt keyframes on attach.** pion's H264 depacketizer appended every FU-A fragment to its buffer whether or not it had seen the start bit, then synthesized a NAL header when the end bit arrived. A consumer attaching mid-NAL got a NAL with a valid IDR type byte and the tail of a slice as its body; `IsKeyframe` accepted it and `api/frame.jpeg` handed it to ffmpeg, which failed with `exit status 183` ("non-intra slice in an IDR NAL unit"). With 2-second keyframes about half of all snapshots failed this way. `RTPDepay` now drops FU-A fragments received before their start bit. Reported upstream as AlexxIT/go2rtc#2490 and pion/rtp#370.
 
 **Readable snapshot errors.** When the `frame.jpeg` transcode fails, the error now includes the last lines of ffmpeg's stderr and the NAL unit types and sizes that were handed to it (for example `7:24 8:4 5:156010`) instead of a bare exit status.

@@ -7,6 +7,7 @@
 > - **Periodic keyframes.** 2-second PLI+FIR keyframe requests for Nest, so consumers joining mid-GOP start in ~1 s instead of waiting out the camera's interval (upstream #2365, #2368).
 > - **SPS/PPS in the RTSP SDP.** RTSP clients such as ffmpeg learn the video dimensions at DESCRIBE instead of needing a large `-probesize`.
 > - **Cameras that are switched off fail fast.** A definitive 4xx from Google ("The camera is not available for streaming") returns immediately instead of after 30 s and 60 s retries, so a fallback source such as a placeholder image kicks in right away.
+> - **Cold dials no longer hang.** A consumer that triggers the WebRTC dial no longer gets stuck on a receiver that never receives packets when Google sends on a different H264 payload type than the first one in its SDP answer (fixes `frame.jpeg` hanging on idle streams).
 > - **No corrupt keyframes on attach.** Drops H264 FU-A fragments received before their start bit; fixes intermittent `frame.jpeg` "exit status 183" failures (upstream #2490, PR #2491, pion/rtp#370).
 > - **Readable snapshot errors.** ffmpeg's stderr and the NAL unit list are included when a keyframe transcode fails.
 > - **GOP cache** (`#gop=1`). Rebase of upstream PR #1887 by seydx: consumers attaching mid-stream get the cached keyframe immediately.
