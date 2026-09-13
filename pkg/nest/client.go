@@ -2,6 +2,7 @@ package nest
 
 import (
 	"errors"
+	"log"
 	"net/url"
 	"strings"
 	"sync"
@@ -104,20 +105,63 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
 // Google answers a switched-off camera with 400 FAILED_PRECONDITION on every
 // GenerateWebRtcStream, and each of those calls counts against the project's
 // per-minute command quota. A dashboard that polls a few off cameras every
-// ten seconds is enough to earn 429s for every camera, and ExchangeSDP then
-// sleeps 30 s before retrying. Remember a definitive answer per device for a
-// short while so repeated dials of an off camera fail instantly without a
-// round trip, and let the fallback source take over.
-const definitiveErrorTTL = 60 * time.Second
-
-var (
-	definitiveMu     sync.Mutex
-	definitiveErrors = map[string]definitiveError{}
+// ten seconds is enough to earn 429s for every camera. Remember a definitive
+// answer per device and fail repeated dials instantly from memory, so the
+// fallback source takes over without a round trip. The hold-off doubles
+// every time Google repeats the verdict - a camera that has been off for an
+// hour is asked again every quarter hour, not every minute - and resets as
+// soon as a dial succeeds.
+const (
+	definitiveErrorMinTTL = time.Minute
+	definitiveErrorMaxTTL = 15 * time.Minute
 )
 
 type definitiveError struct {
 	err   error
+	ttl   time.Duration
 	until time.Time
+}
+
+type definitiveCache struct {
+	mu      sync.Mutex
+	entries map[string]definitiveError
+	now     func() time.Time
+}
+
+var definitive = &definitiveCache{entries: map[string]definitiveError{}, now: time.Now}
+
+// recent returns the cached verdict for a device while its hold-off lasts.
+func (c *definitiveCache) recent(deviceID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if d, ok := c.entries[deviceID]; ok && c.now().Before(d.until) {
+		return d.err
+	}
+	return nil
+}
+
+// remember records a verdict and returns the hold-off it will be honoured
+// for: the minimum on a first failure, double the previous one on a repeat.
+func (c *definitiveCache) remember(deviceID string, err error) time.Duration {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ttl := definitiveErrorMinTTL
+	if d, ok := c.entries[deviceID]; ok {
+		ttl = d.ttl * 2
+		if ttl > definitiveErrorMaxTTL {
+			ttl = definitiveErrorMaxTTL
+		}
+	}
+	c.entries[deviceID] = definitiveError{err: err, ttl: ttl, until: c.now().Add(ttl)}
+	return ttl
+}
+
+// forget clears a device's verdict once a dial succeeds, so the next
+// failure starts the back-off from the minimum again.
+func (c *definitiveCache) forget(deviceID string) {
+	c.mu.Lock()
+	delete(c.entries, deviceID)
+	c.mu.Unlock()
 }
 
 // isDeviceAnswer reports whether an error is Google's verdict on the device
@@ -128,23 +172,7 @@ func isDeviceAnswer(err error) bool {
 	return errors.As(err, &se) && se.Code >= 400 && se.Code < 500 && se.Code != 429
 }
 
-func recentDefinitiveError(deviceID string) error {
-	definitiveMu.Lock()
-	defer definitiveMu.Unlock()
-	if d, ok := definitiveErrors[deviceID]; ok {
-		if time.Now().Before(d.until) {
-			return d.err
-		}
-		delete(definitiveErrors, deviceID)
-	}
-	return nil
-}
-
-func rememberDefinitiveError(deviceID string, err error) {
-	definitiveMu.Lock()
-	definitiveErrors[deviceID] = definitiveError{err: err, until: time.Now().Add(definitiveErrorTTL)}
-	definitiveMu.Unlock()
-}
+func recentDefinitiveError(deviceID string) error { return definitive.recent(deviceID) }
 
 func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, error) {
 	maxRetries := 3
@@ -194,7 +222,8 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 			// device (404) will not change within the 90s retry window
 			if !retryable(err) {
 				if isDeviceAnswer(err) {
-					rememberDefinitiveError(deviceID, err)
+					ttl := definitive.remember(deviceID, err)
+					log.Printf("nest: %s: not asking Google again for %s", err, ttl)
 				}
 				return nil, err
 			}
@@ -210,6 +239,8 @@ func rtcConn(nestAPI *API, rawURL, projectID, deviceID string) (*WebRTCClient, e
 		if err = conn.SetAnswer(answer); err != nil {
 			return nil, err
 		}
+
+		definitive.forget(deviceID)
 
 		return &WebRTCClient{conn: conn, api: nestAPI, stream: stream}, nil
 	}
