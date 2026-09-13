@@ -97,10 +97,25 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		// Keeps keyframes ~2s fresh so RTSP consumers (Homebridge live view) start fast.
 		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") && remote.Kind() == webrtc.RTPCodecTypeVideo {
 			go func() {
-				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
+				mediaSSRC := uint32(remote.SSRC())
+				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: mediaSSRC}}
+				// Google reportedly ignores bare PLI but honors FIR (#2365); both are
+				// negotiated in the offer. FIR needs an incrementing sequence number
+				// (RFC 5104) or repeated requests are deduplicated.
+				var fir *rtcp.FullIntraRequest
+				if c.FormatName == "nest/webrtc" {
+					fir = &rtcp.FullIntraRequest{
+						MediaSSRC: mediaSSRC,
+						FIR:       []rtcp.FIREntry{{SSRC: mediaSSRC}},
+					}
+					pkts = append(pkts, fir)
+				}
 				t := time.NewTicker(time.Second * 2)
 				defer t.Stop()
 				for range t.C {
+					if fir != nil {
+						fir.FIR[0].SequenceNumber++
+					}
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}
