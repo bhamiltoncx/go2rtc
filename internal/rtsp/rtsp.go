@@ -177,6 +177,7 @@ func tcpHandler(conn *rtsp.Conn) {
 			log.Debug().Str("stream", name).Msg("[rtsp] new consumer")
 
 			conn.SessionName = app.UserAgent
+			conn.GOP = true
 
 			query := conn.URL.Query()
 			conn.Medias = ParseQuery(query)
@@ -202,6 +203,10 @@ func tcpHandler(conn *rtsp.Conn) {
 						{Name: core.CodecAAC, ClockRate: 16000},
 					},
 				})
+			}
+
+			if query.Get("gop") == "0" {
+				conn.GOP = false
 			}
 
 			if s := query.Get("pkt_size"); s != "" {

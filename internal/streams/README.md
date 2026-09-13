@@ -84,6 +84,17 @@ streams:
     - ffmpeg:camera3#video=h264#audio=opus#hardware
 ```
 
+## GOP cache
+
+Add `#gop=1` to a source to keep its last [GOP](https://en.wikipedia.org/wiki/Group_of_pictures) in memory. A consumer that attaches to an already running stream is then served the cached keyframe and the frames after it immediately, instead of waiting for the camera's next keyframe. Disabled by default.
+
+```yaml
+streams:
+  camera: rtsp://192.168.1.123/stream#gop=1
+```
+
+The cache only fills while the stream is active - combine with [preload](#preload-stream) so the very first viewer benefits too. Memory cost is up to two GOPs per stream. **RTSP clients** can opt out with `?gop=0` in the request URL.
+
 ## Examples
 
 ```yaml

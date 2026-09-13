@@ -28,6 +28,11 @@ func RTPDepay(codec *core.Codec, handler core.HandlerFunc) core.HandlerFunc {
 	inFragment := false
 
 	return func(packet *rtp.Packet) {
+		if packet.Version == RTPPacketVersionAVC {
+			handler(packet)
+			return
+		}
+
 		//log.Printf("[RTP] codec: %s, nalu: %2d, size: %6d, ts: %10d, pt: %2d, ssrc: %d, seq: %d, %v", codec.Name, packet.Payload[0]&0x1F, len(packet.Payload), packet.Timestamp, packet.PayloadType, packet.SSRC, packet.SequenceNumber, packet.Marker)
 
 		if len(packet.Payload) >= 2 && packet.Payload[0]&0x1F == NALUTypeFUA {
@@ -136,7 +141,9 @@ func RTPPay(mtu uint16, handler core.HandlerFunc) core.HandlerFunc {
 
 	return func(packet *rtp.Packet) {
 		if packet.Version != RTPPacketVersionAVC {
-			handler(packet)
+			clone := *packet
+			clone.Header.SequenceNumber = sequencer.NextSequenceNumber()
+			handler(&clone)
 			return
 		}
 
