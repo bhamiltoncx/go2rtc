@@ -90,11 +90,12 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		// Patched: also request periodic keyframes for the Nest source (ModeActiveProducer,
-		// FormatName "nest/webrtc"). Upstream only does this for PassiveProducer (WHIP/browser
-		// push). Gating on FormatName (not the mode) avoids forcing 2s IDRs on other
-		// ActiveProducer WebRTC sources (ring/tuya battery cams etc.) where it'd be harmful.
-		// Keeps keyframes ~2s fresh so RTSP consumers (Homebridge live view) start fast.
+		// Request periodic keyframes from passive producers (WHIP, browser push)
+		// and from the Nest source. Nest is an active-pull producer whose keyframe
+		// interval drifts long when idle, so a consumer joining mid-GOP would wait
+		// up to a whole interval to start. Gate on the format name rather than the
+		// mode: other active-pull WebRTC sources (battery cameras) should not be
+		// forced into a 2 s IDR cadence.
 		if (c.Mode == core.ModePassiveProducer || c.FormatName == "nest/webrtc") && remote.Kind() == webrtc.RTPCodecTypeVideo {
 			go func() {
 				mediaSSRC := uint32(remote.SSRC())
@@ -123,12 +124,11 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}()
 		}
 
-		// Patched: capture SPS/PPS from the Nest H264 stream and append sprop-parameter-sets to
-		// the codec FmtpLine, so RTSP consumers (Homebridge live view via ffmpeg) learn video
-		// dimensions from the DESCRIBE SDP and start fast instead of waiting for an in-band
-		// keyframe + probe (~3.7s -> near-instant). Google's WebRTC SDP has profile-level-id but
-		// no sprop; SPS/PPS arrive in-band (usually bundled in a STAP-A). Upstream does the
-		// equivalent for H265 (pkg/dvrip). Gated on FormatName like the PLI patch above.
+		// Google's SDP answer carries profile-level-id but no sprop-parameter-sets;
+		// SPS/PPS arrive in-band, usually bundled in a STAP-A. Capture them once and
+		// append them to the codec's fmtp line so RTSP consumers learn the video
+		// dimensions from the DESCRIBE SDP instead of waiting for an in-band
+		// keyframe and a probe. pkg/dvrip does the equivalent for H265.
 		captureSprop := c.FormatName == "nest/webrtc" && codec.Name == core.CodecH264 &&
 			!strings.Contains(codec.FmtpLine, "sprop-parameter-sets=")
 		var spropSPS, spropPPS []byte
