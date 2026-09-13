@@ -165,3 +165,36 @@ func TestWindowPrunesOldReservations(t *testing.T) {
 		t.Fatalf("expected the aged-out reservation pruned, have %d", len(w.times))
 	}
 }
+
+// Keep-alives must leave room for dials: with nine sessions extending at
+// once, only seven go now and a dial still has slots.
+func TestBackgroundLeavesDialReserve(t *testing.T) {
+	l, _, slept := testLimiter(time.Date(2026, 9, 13, 14, 0, 0, 0, time.UTC))
+
+	var throttled int
+	for i := 0; i < 9; i++ {
+		dev := string(rune('a' + i))
+		err := l.CommandBackground("p", dev, "extend", 0) // no waiting: count who gets a slot now
+		var te *ThrottledError
+		if errors.As(err, &te) {
+			throttled++
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := 9 - (executeCommandPerMinute - dialReserve); throttled != want {
+		t.Fatalf("expected %d keep-alives held back, got %d", want, throttled)
+	}
+	for i := 0; i < dialReserve; i++ {
+		if err := l.Command("p", "cam", "generate", dialMaxWait); err != nil {
+			t.Fatalf("dial %d should still have a reserved slot: %v", i, err)
+		}
+	}
+	var te *ThrottledError
+	if err := l.Command("p", "cam2", "generate", dialMaxWait); !errors.As(err, &te) {
+		t.Fatalf("budget should now be exhausted, got %v", err)
+	}
+	if len(*slept) != 0 {
+		t.Fatalf("no sleeps expected, got %v", *slept)
+	}
+}

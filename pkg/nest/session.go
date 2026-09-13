@@ -25,9 +25,14 @@ type session struct {
 	done  bool
 }
 
-func newSession(expiresAt time.Time, lead time.Duration, extend func() (time.Time, error)) *session {
+// newSession starts keeping a stream alive. spread pulls the first extension
+// forward by up to that much; every stream dialed at start-up otherwise
+// extends in the same few seconds every cycle, which spends most of a minute's
+// command quota in one burst. Google grants a fresh five minutes from each
+// extension, so an offset introduced once persists.
+func newSession(expiresAt time.Time, lead, spread time.Duration, extend func() (time.Time, error)) *session {
 	s := &session{lead: lead, extend: extend}
-	s.schedule(expiresAt)
+	s.schedule(expiresAt.Add(-spread))
 	return s
 }
 
