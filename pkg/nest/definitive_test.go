@@ -26,7 +26,7 @@ func TestDefinitiveCacheBacksOffExponentially(t *testing.T) {
 	if c.recent("cam") != nil {
 		t.Fatal("expired verdict must not be served")
 	}
-	for i, want := range []time.Duration{2 * time.Minute, 4 * time.Minute, 8 * time.Minute, 15 * time.Minute, 15 * time.Minute} {
+	for i, want := range []time.Duration{2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
 		if ttl := c.remember("cam", off); ttl != want {
 			t.Fatalf("repeat %d: hold-off should be %s, got %s", i+1, want, ttl)
 		}

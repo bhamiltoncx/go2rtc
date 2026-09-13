@@ -109,11 +109,11 @@ func (c *WebRTCClient) MarshalJSON() ([]byte, error) {
 // answer per device and fail repeated dials instantly from memory, so the
 // fallback source takes over without a round trip. The hold-off doubles
 // every time Google repeats the verdict - a camera that has been off for an
-// hour is asked again every quarter hour, not every minute - and resets as
+// hour is asked again every five minutes, not every minute - and resets as
 // soon as a dial succeeds.
 const (
 	definitiveErrorMinTTL = time.Minute
-	definitiveErrorMaxTTL = 15 * time.Minute
+	definitiveErrorMaxTTL = 5 * time.Minute
 )
 
 type definitiveError struct {
