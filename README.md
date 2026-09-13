@@ -1,3 +1,16 @@
+> [!IMPORTANT]
+> ## This is a fork of go2rtc with fixes for Google Nest cameras
+>
+> [bhamiltoncx/go2rtc](https://github.com/bhamiltoncx/go2rtc) carries a set of changes for `nest:` (WebRTC) sources that are not yet in [upstream go2rtc](https://github.com/AlexxIT/go2rtc). If you do not use Nest cameras, use upstream. The `master` branch here is upstream `master` plus these commits; the changes are gated on the `nest/webrtc` producer so other sources are unaffected. Details and config examples are in [`internal/nest/README.md`](internal/nest/README.md#changes-in-this-fork).
+>
+> - **Streams no longer drop every 5 minutes.** Per-stream session keep-alive instead of one shared timer that never fired (upstream #2108, #2319).
+> - **Periodic keyframes.** 2-second PLI+FIR keyframe requests for Nest, so consumers joining mid-GOP start in ~1 s instead of waiting out the camera's interval (upstream #2365, #2368).
+> - **SPS/PPS in the RTSP SDP.** RTSP clients such as ffmpeg learn the video dimensions at DESCRIBE instead of needing a large `-probesize`.
+> - **Cameras that are switched off fail fast.** A definitive 4xx from Google ("The camera is not available for streaming") returns immediately instead of after 30 s and 60 s retries, so a fallback source such as a placeholder image kicks in right away.
+> - **No corrupt keyframes on attach.** Drops H264 FU-A fragments received before their start bit; fixes intermittent `frame.jpeg` "exit status 183" failures (upstream #2490, PR #2491, pion/rtp#370).
+> - **Readable snapshot errors.** ffmpeg's stderr and the NAL unit list are included when a keyframe transcode fails.
+> - **GOP cache** (`#gop=1`). Rebase of upstream PR #1887 by seydx: consumers attaching mid-stream get the cached keyframe immediately.
+
 <h1 align="center">
   <a href="https://github.com/AlexxIT/go2rtc">
     <img src="./website/images/logo.gif" alt="go2rtc - GitHub">
